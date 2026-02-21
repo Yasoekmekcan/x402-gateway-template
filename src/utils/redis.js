@@ -8,6 +8,7 @@ import { Redis } from '@upstash/redis';
 // Used for:
 //   1. Nonce tracking (replay attack prevention)
 //   2. Payment-identifier idempotency (duplicate charge prevention)
+//   3. Credit system (backend failure compensation)
 //
 // All keys are prefixed with "x402:" to avoid conflicts
 // with other services sharing the same Upstash instance.
@@ -31,6 +32,7 @@ function getRedis() {
 // ─── Key Prefixes ──────────────────────────────────────────
 const NONCE_PREFIX = 'x402:nonce:';
 const IDEMPOTENCY_PREFIX = 'x402:idempotency:';
+const CREDIT_PREFIX = 'x402:credit:';
 
 // ─── TTLs (seconds) ────────────────────────────────────────
 const NONCE_PENDING_TTL = 3600;        // 1 hour for pending settlements
@@ -129,6 +131,100 @@ export async function setIdempotencyCache(paymentId, responseData) {
     );
   } catch (err) {
     console.error('[redis] setIdempotencyCache error:', err.message);
+  }
+}
+
+// ============================================================
+// Credit Operations — Backend Failure Compensation
+//
+// Credits are issued when a paid request settles on-chain but
+// the backend returns a creditworthy error (e.g. 5xx).
+// The payer can redeem credits on subsequent requests by
+// presenting a valid payment signature (proves wallet ownership)
+// without needing to settle on-chain again.
+//
+// Key format: x402:credit:{payerAddress}:{routeKey}
+// Value: integer count of available credits
+//
+// Security: Payer address is extracted from the cryptographically
+// verified EIP-712/SVM signature — cannot be spoofed.
+//
+// Degradation: All credit operations fail gracefully.
+//   - Read failures → skip credits, proceed with normal payment
+//   - Write failures → log and move on, agent misses one credit
+// ============================================================
+
+/**
+ * Get credit count for a payer on a specific route.
+ * Returns integer count (0 if no credits or on error).
+ * Fails open — returns 0 on error so normal payment proceeds.
+ */
+export async function getCreditCount(payerAddress, routeKey) {
+  try {
+    const key = `${CREDIT_PREFIX}${payerAddress.toLowerCase()}:${routeKey}`;
+    const count = await getRedis().get(key);
+    return typeof count === 'number' ? count : 0;
+  } catch (err) {
+    console.error('[redis] getCreditCount error:', err.message);
+    return 0; // Fail open — no credits means normal payment flow
+  }
+}
+
+/**
+ * Atomically decrement a credit for a payer on a specific route.
+ * Returns true if a credit was consumed, false if none available.
+ *
+ * Uses Lua script for atomicity — prevents race conditions where
+ * two concurrent requests both read count=1 and both try to consume.
+ */
+export async function decrementCredit(payerAddress, routeKey) {
+  try {
+    const key = `${CREDIT_PREFIX}${payerAddress.toLowerCase()}:${routeKey}`;
+    const result = await getRedis().eval(
+      `local count = tonumber(redis.call('GET', KEYS[1]) or 0)
+       if count > 0 then
+         redis.call('DECR', KEYS[1])
+         return 1
+       end
+       return 0`,
+      [key],
+      []
+    );
+    return result === 1;
+  } catch (err) {
+    console.error('[redis] decrementCredit error:', err.message);
+    return false; // Fail closed — don't grant free access on error
+  }
+}
+
+/**
+ * Atomically increment a credit for a payer on a specific route,
+ * capped at maxCredits. Resets TTL on every increment so credits
+ * stay alive as long as failures keep occurring.
+ *
+ * @param {string} payerAddress - Wallet address of the payer
+ * @param {string} routeKey - Route identifier (e.g. 'myapi')
+ * @param {number} maxCredits - Maximum credits per payer per route
+ * @param {number} ttlSeconds - TTL in seconds for the credit key
+ * @returns {number} New credit count after increment, or -1 on error
+ */
+export async function incrementCredit(payerAddress, routeKey, maxCredits, ttlSeconds) {
+  try {
+    const key = `${CREDIT_PREFIX}${payerAddress.toLowerCase()}:${routeKey}`;
+    const result = await getRedis().eval(
+      `local count = tonumber(redis.call('GET', KEYS[1]) or 0)
+       if count < tonumber(ARGV[1]) then
+         count = redis.call('INCR', KEYS[1])
+       end
+       redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+       return count`,
+      [key],
+      [maxCredits, ttlSeconds]
+    );
+    return typeof result === 'number' ? result : -1;
+  } catch (err) {
+    console.error('[redis] incrementCredit error:', err.message);
+    return -1; // Non-critical — agent misses one credit
   }
 }
 

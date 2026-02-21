@@ -19,8 +19,12 @@ import {
   linea,
   unichain,
   megaeth,
+  sonic,
+  hyperEvm,
+  ink,
+  monad
 } from 'viem/chains';
-import { ROUTE_CONFIG, SUPPORTED_NETWORKS } from '../config/routes.js';
+import { ROUTE_CONFIG, SUPPORTED_NETWORKS, CREDIT_DEFAULTS } from '../config/routes.js';
 import {
   getNonce,
   setNoncePending,
@@ -28,6 +32,9 @@ import {
   deleteNonce,
   getIdempotencyCache,
   setIdempotencyCache,
+  getCreditCount,
+  decrementCredit,
+  incrementCredit,
 } from '../utils/redis.js';
 
 // ─── SVM Imports ───────────────────────────────────────────
@@ -72,6 +79,10 @@ const VIEM_CHAINS = {
   59144: linea,
   130: unichain,
   4326: megaeth,
+  146: sonic,
+  999: hyperEvm,
+  57073: ink,
+  143: monad,
   // Add more: import from viem/chains and register here
 };
 
@@ -555,6 +566,20 @@ async function buildPaymentRequired(routeConfig, req, routeKey) {
   return { headerBase64, body };
 }
 
+// ─── Credit System Helpers ──────────────────────────────────
+
+function isCreditSystemEnabled() {
+  return process.env.ENABLE_CREDIT_SYSTEM === 'true';
+}
+
+function getCreditConfig(routeConfig) {
+  return {
+    creditOnStatusCodes: routeConfig.creditOnStatusCodes || CREDIT_DEFAULTS.creditOnStatusCodes,
+    maxCreditsPerPayer: routeConfig.maxCreditsPerPayer ?? CREDIT_DEFAULTS.maxCreditsPerPayer,
+    creditTtl: routeConfig.creditTtl ?? CREDIT_DEFAULTS.creditTtl,
+  };
+}
+
 // ============================================================
 // Express middleware factory
 // ============================================================
@@ -635,72 +660,134 @@ export function x402PaymentMiddleware(routeKey) {
       });
     }
 
-    // Mark nonce as pending
-    let nonceKey = null;
-    if (useSvm) {
-      const txData = paymentPayload.payload?.transaction;
-      if (txData) {
-        const crypto = await import('crypto');
-        nonceKey = 'svm:' + crypto.createHash('sha256').update(txData).digest('hex');
-      }
-    } else if (!useEvmFacilitator) {
-      nonceKey = paymentPayload.payload?.authorization?.nonce;
-    }
+    // Extract payer address (verified via signature — cannot be spoofed)
+    const payerAddress = verification.payer
+      || paymentPayload.payload?.authorization?.from
+      || 'unknown';
 
-    if (nonceKey) {
-      const acquired = await setNoncePending(nonceKey, {
-        network: paymentPayload.network,
-        payer: verification.payer || paymentPayload.payload?.authorization?.from || 'unknown',
-        route: routeKey, vm: useSvm ? 'svm' : 'evm',
-      });
-      if (!acquired) {
-        return res.status(402).json({
-          error: 'Payment verification failed',
-          reason: 'Nonce already used or settlement in progress',
-        });
+    // ── Credit check — consume credit if available ───────────
+    let creditConsumed = false;
+
+    if (isCreditSystemEnabled() && payerAddress !== 'unknown') {
+      const creditConfig = getCreditConfig(routeConfig);
+
+      if (creditConfig.creditOnStatusCodes.length > 0) {
+        const creditCount = await getCreditCount(payerAddress, routeKey);
+
+        if (creditCount > 0) {
+          creditConsumed = await decrementCredit(payerAddress, routeKey);
+          if (creditConsumed) {
+            console.log(`[x402] Credit consumed: ${payerAddress.slice(0, 10)}... | route: ${routeKey} | remaining: ${creditCount - 1}`);
+          }
+        }
       }
     }
 
-    // Settle payment
-    try {
-      let settlement;
+    // ── Settlement (skip if credit was consumed) ─────────────
+    let didSettle = false;
+
+    if (!creditConsumed) {
+      // Mark nonce as pending
+      let nonceKey = null;
       if (useSvm) {
-        settlement = await settlePaymentSvm(paymentPayload, enrichedRouteConfig, network);
-      } else if (useEvmFacilitator) {
-        settlement = await settlePaymentViaFacilitator(paymentPayload, enrichedRouteConfig, network);
-      } else {
-        settlement = await settlePaymentEvm(paymentPayload);
+        const txData = paymentPayload.payload?.transaction;
+        if (txData) {
+          const crypto = await import('crypto');
+          nonceKey = 'svm:' + crypto.createHash('sha256').update(txData).digest('hex');
+        }
+      } else if (!useEvmFacilitator) {
+        nonceKey = paymentPayload.payload?.authorization?.nonce;
       }
 
-      // Confirm nonce
       if (nonceKey) {
-        await setNonceConfirmed(nonceKey, {
-          txHash: settlement.txHash, network: settlement.network,
-          blockNumber: settlement.blockNumber,
-          payer: settlement.payer || paymentPayload.payload?.authorization?.from || 'unknown',
+        const acquired = await setNoncePending(nonceKey, {
+          network: paymentPayload.network,
+          payer: payerAddress,
           route: routeKey, vm: useSvm ? 'svm' : 'evm',
         });
+        if (!acquired) {
+          return res.status(402).json({
+            error: 'Payment verification failed',
+            reason: 'Nonce already used or settlement in progress',
+          });
+        }
       }
 
-      const paymentResponseData = {
-        success: true, txHash: settlement.txHash,
-        network: settlement.network, blockNumber: settlement.blockNumber,
-        ...(settlement.facilitator && { facilitator: settlement.facilitator }),
-      };
+      // Settle payment on-chain
+      try {
+        let settlement;
+        if (useSvm) {
+          settlement = await settlePaymentSvm(paymentPayload, enrichedRouteConfig, network);
+        } else if (useEvmFacilitator) {
+          settlement = await settlePaymentViaFacilitator(paymentPayload, enrichedRouteConfig, network);
+        } else {
+          settlement = await settlePaymentEvm(paymentPayload);
+        }
 
-      const paymentResponseHeader = Buffer.from(JSON.stringify(paymentResponseData)).toString('base64');
-      res.set('PAYMENT-RESPONSE', paymentResponseHeader);
+        // Confirm nonce
+        if (nonceKey) {
+          await setNonceConfirmed(nonceKey, {
+            txHash: settlement.txHash, network: settlement.network,
+            blockNumber: settlement.blockNumber,
+            payer: settlement.payer || payerAddress,
+            route: routeKey, vm: useSvm ? 'svm' : 'evm',
+          });
+        }
 
-      // Cache for idempotency
-      if (paymentId) {
-        await setIdempotencyCache(paymentId, { paymentResponseHeader, settlement: paymentResponseData });
+        const paymentResponseData = {
+          success: true, txHash: settlement.txHash,
+          network: settlement.network, blockNumber: settlement.blockNumber,
+          ...(settlement.facilitator && { facilitator: settlement.facilitator }),
+        };
+
+        const paymentResponseHeader = Buffer.from(JSON.stringify(paymentResponseData)).toString('base64');
+        res.set('PAYMENT-RESPONSE', paymentResponseHeader);
+
+        // Cache for idempotency
+        if (paymentId) {
+          await setIdempotencyCache(paymentId, { paymentResponseHeader, settlement: paymentResponseData });
+        }
+
+        didSettle = true;
+      } catch (err) {
+        if (nonceKey) await deleteNonce(nonceKey);
+        console.error(`[x402] Settlement failed:`, err.message);
+        return res.status(402).json({ error: 'Payment settlement failed', reason: err.message });
       }
-
-      next();
-    } catch (err) {
-      if (nonceKey) await deleteNonce(nonceKey);
-      console.error(`[x402] Settlement failed:`, err.message);
-      return res.status(402).json({ error: 'Payment settlement failed', reason: err.message });
+    } else {
+      // Credit was consumed — set header indicating credit usage
+      res.set('X-x402-Credit', 'consumed');
     }
+
+    // ── Async credit issuance on response finish ─────────────
+    if (didSettle && isCreditSystemEnabled() && payerAddress !== 'unknown') {
+      const creditConfig = getCreditConfig(routeConfig);
+
+      if (creditConfig.creditOnStatusCodes.length > 0) {
+        res.on('finish', () => {
+          const statusCode = res.statusCode;
+
+          if (creditConfig.creditOnStatusCodes.includes(statusCode)) {
+            incrementCredit(
+              payerAddress,
+              routeKey,
+              creditConfig.maxCreditsPerPayer,
+              creditConfig.creditTtl
+            ).then(newCount => {
+              if (newCount >= 0) {
+                console.log(`[x402] Credit issued: ${payerAddress.slice(0, 10)}... | route: ${routeKey} | reason: backend ${statusCode} | total: ${newCount}`);
+                if (newCount >= creditConfig.maxCreditsPerPayer) {
+                  console.warn(`[x402] Credit cap reached: ${payerAddress.slice(0, 10)}... | route: ${routeKey} | cap: ${creditConfig.maxCreditsPerPayer} — backend may be degraded`);
+                }
+              }
+            }).catch(err => {
+              console.error(`[x402] Credit issuance failed (non-critical): ${err.message}`);
+            });
+          }
+        });
+      }
+    }
+
+    next();
   };
 }
